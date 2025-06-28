@@ -9,3 +9,9 @@ aiohttp
 python-jose
 base58
 rich
+x402
+cdp-sdk
+x402
+cdp-sdk
+web3
+eth-account

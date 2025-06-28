@@ -21,8 +21,7 @@ logger = logging.getLogger(__name__)
 # Import x402 for payment verification
 try:
     import x402
-    from x402.types import PaymentRequirements, PaymentRequiredResponse
-    from x402.verification import verify_payment as x402_verify_payment
+    from x402 import PaymentRequest, PaymentVerification
     HAS_X402 = True
     logger.info("Successfully imported x402 SDK")
 except ImportError as e:
@@ -31,12 +30,11 @@ except ImportError as e:
 
 # Import CDP SDK for wallet operations
 try:
-    # Mock import since we're using direct API calls
-    # from cdp import WalletClient  # This is a hypothetical import, we'll use requests directly
+    from cdp import Cdp, Wallet, WalletData
     HAS_CDP = True
-    logger.info("CDP wallet API integration enabled")
-except ImportError:
-    logger.warning("CDP wallet SDK not available, simulating CDP wallet operations")
+    logger.info("CDP SDK successfully imported")
+except ImportError as e:
+    logger.warning(f"CDP SDK not available, simulating CDP wallet operations. Error: {e}")
     HAS_CDP = False
 
 class PaymentManager:
@@ -60,16 +58,21 @@ class PaymentManager:
         self.token_contract = os.getenv("TOKEN_CONTRACT", "0x036CbD53842c5426634e7929541eC2318f3dCF7e")
         self.default_currency = os.getenv("DEFAULT_CURRENCY", "USDC")
         self.charging_rate = float(os.getenv("CHARGING_RATE_PER_KWH", "0.35"))
-        self.enable_fallback = os.getenv("ENABLE_FALLBACK_MODE", "true").lower() == "true"
+        self.enable_fallback = os.getenv("ENABLE_FALLBACK_MODE", "false").lower() == "true"
         
         # Initialize CDP client if available
         self.cdp_client = None
-        if self.api_key and self.api_secret:
-            logger.info("CDP API credentials found, CDP API integration enabled")
+        if HAS_CDP and self.api_key and self.api_secret:
+            try:
+                Cdp.configure(self.api_key, self.api_secret)
+                logger.info("CDP client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize CDP client: {e}")
+                if not self.enable_fallback:
+                    raise
         else:
-            logger.warning("CDP API credentials missing, using demo mode")
-        
-        # Log x402 configuration
+            logger.warning("CDP API credentials missing or SDK unavailable, using demo mode")
+          # Log x402 configuration
         if HAS_X402:
             if self.x402_verification_key:
                 logger.info("x402 verification key found, x402 payment verification enabled")
@@ -77,10 +80,11 @@ class PaymentManager:
                 logger.warning("x402 verification key missing, verification will be simulated")
         
         logger.info(f"PaymentManager initialized for network: {self.network['name']} (Chain ID: {self.network['chain_id']})")
+        logger.info(f"Fallback mode: {'enabled' if self.enable_fallback else 'disabled'}")
         
     def get_payment_requirements(self, kwh_amount: float, station_id: str) -> Dict[str, Any]:
         """
-        Generate payment requirements for a charging session
+        Generate payment requirements for a charging session using real x402
         
         Args:
             kwh_amount: Amount of kWh to charge
@@ -97,34 +101,34 @@ class PaymentManager:
         
         try:
             if HAS_X402:
-                logger.info(f"Creating x402 payment requirements for {amount} {self.default_currency}")
+                logger.info(f"Creating real x402 payment requirements for {amount} {self.default_currency}")
                 
                 # Create a unique recipient address for this station (demo purposes)
-                recipient_address = f"0x{station_id[-4:]}{'0' * 36}"  # Use last 4 chars of station ID
+                recipient_address = f"0x{station_id.zfill(40)}"  # Proper address format
                 
-                # Create proper x402 payment requirements
-                requirements = PaymentRequirements(
-                    amount=str(amount),
+                # Create x402 payment request
+                payment_request = PaymentRequest(
+                    amount=amount,
                     token=self.token_contract,
                     recipient=recipient_address,
-                    network=self.network["name"]
+                    network=self.network["name"],
+                    memo=f"ChargeX session for {kwh_amount} kWh at station {station_id}"
                 )
                 
-                # Generate payment required response using x402 SDK
-                payment_required = x402.create_payment_required_response(
-                    requirements=requirements,
-                    verification_key=self.x402_verification_key or "demo-key"
-                )
+                # Generate the payment URL
+                payment_url = x402.create_payment_url(payment_request)
                 
-                logger.info(f"Successfully created x402 payment requirements: {payment_required}")
+                logger.info(f"Successfully created x402 payment requirements")
                 
                 return {
-                    "payment_required": payment_required.to_dict() if hasattr(payment_required, "to_dict") else payment_required,
-                    "payment_url": f"https://wallet.coinbase.com/pay?token={self.token_contract}&amount={amount}&recipient={recipient_address}&network={self.network['name']}",
+                    "payment_request": payment_request.to_dict(),
+                    "payment_url": payment_url,
                     "amount": amount,
                     "currency": self.default_currency,
                     "station_id": station_id,
-                    "payment_id": payment_id
+                    "payment_id": payment_id,
+                    "recipient": recipient_address,
+                    "network": self.network["name"]
                 }
             
             raise Exception("x402 SDK not available")
@@ -133,29 +137,31 @@ class PaymentManager:
             logger.error(f"Error creating x402 payment requirements: {e}")
             
             if not self.enable_fallback:
-                raise
+                raise RuntimeError(f"Payment system unavailable: {e}")
         
         # Fallback or simulation mode
         logger.info("Using fallback/simulation mode for payment requirements")
+        recipient_address = f"0x{station_id.zfill(40)}"
         return {
-            "payment_required": {
+            "payment_request": {
                 "token": self.token_contract,
                 "amount": str(amount),
-                "recipient": f"0x{station_id[-4:]}{'0' * 36}",  # Demo recipient address
+                "recipient": recipient_address,
                 "network": self.network["name"],
                 "nonce": str(int(time.time())),
                 "expires_at": str(int(time.time() + 3600))  # 1 hour from now
             },
-            "payment_url": f"https://wallet.example.com/pay?amount={amount}&token=USDC&network={self.network['name']}",
+            "payment_url": f"https://wallet.coinbase.com/pay?amount={amount}&token=USDC&network={self.network['name']}",
             "amount": amount,
             "currency": self.default_currency,
             "station_id": station_id,
-            "payment_id": payment_id
+            "payment_id": payment_id,
+            "recipient": recipient_address,
+            "network": self.network["name"]
         }
-    
-    def verify_payment(self, payment_data: Dict[str, Any]) -> Dict[str, Any]:
+      def verify_payment(self, payment_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Verify a payment using x402 verification
+        Verify a payment using real x402 verification
         
         Args:
             payment_data: Dictionary containing the payment proof
@@ -163,26 +169,31 @@ class PaymentManager:
         Returns:
             Dictionary with verification result
         """
-        logger.info(f"Verifying payment: {json.dumps(payment_data)[:100]}...")
+        logger.info(f"Verifying payment: {json.dumps(payment_data, default=str)[:100]}...")
         
         try:
-            if HAS_X402 and self.x402_verification_key:
+            if HAS_X402 and self.x402_verification_key and not self.x402_verification_key.startswith("demo"):
                 # Extract proof from payment data
                 proof = payment_data.get("proof", {})
                 
-                logger.info(f"Using x402 SDK to verify payment with proof: {json.dumps(proof)[:100]}...")
+                logger.info(f"Using real x402 SDK to verify payment")
                 
                 # Use x402 to verify the payment
-                verification_result = x402_verify_payment(
+                verification = PaymentVerification(
                     proof=proof,
                     verification_key=self.x402_verification_key
                 )
+                
+                verification_result = verification.verify()
                 
                 if verification_result.verified:
                     logger.info(f"Payment verified successfully: {verification_result.transaction_hash}")
                     return {
                         "verified": True,
                         "tx_hash": verification_result.transaction_hash,
+                        "amount": verification_result.amount,
+                        "token": verification_result.token,
+                        "timestamp": verification_result.timestamp,
                         "details": verification_result.to_dict() if hasattr(verification_result, "to_dict") else {}
                     }
                 else:
@@ -193,7 +204,7 @@ class PaymentManager:
                         "details": verification_result.to_dict() if hasattr(verification_result, "to_dict") else {}
                     }
             
-            raise Exception("x402 SDK or verification key not available")
+            raise Exception("x402 SDK or real verification key not available")
                 
         except Exception as e:
             logger.error(f"Error verifying payment: {e}")
@@ -204,7 +215,7 @@ class PaymentManager:
                     "error": f"Error during verification: {str(e)}"
                 }
         
-    # For demo purposes, simulate successful verification in fallback mode
+        # For demo purposes, simulate successful verification in fallback mode
         logger.info("Using simulated payment verification (fallback mode)")
         
         # Always verify in demo mode to ensure the flow is not interrupted
@@ -214,16 +225,19 @@ class PaymentManager:
         return {
             "verified": True,
             "tx_hash": simulated_tx_hash,
+            "amount": payment_data.get("amount", "10.0"),
+            "token": self.default_currency,
+            "timestamp": int(time.time()),
             "details": {
+                "mode": "simulation",
                 "timestamp": int(time.time()),
                 "amount": payment_data.get("amount", "10.0"),
                 "token": self.default_currency
             }
         }
-    
-    def get_wallet_info(self, wallet_address: Optional[str] = None) -> Dict[str, Any]:
+      def get_wallet_info(self, wallet_address: Optional[str] = None) -> Dict[str, Any]:
         """
-        Get CDP wallet information
+        Get real CDP wallet information
         
         Args:
             wallet_address: Optional wallet address to check
@@ -235,47 +249,40 @@ class PaymentManager:
             wallet_address = "0x1234567890123456789012345678901234567890"  # Default demo address
         
         try:
-            if self.api_key and self.api_secret and self.cdp_wallet_api_url:
-                logger.info(f"Getting wallet info for address: {wallet_address}")
+            if HAS_CDP and self.api_key and self.api_secret:
+                logger.info(f"Getting real CDP wallet info for address: {wallet_address}")
                 
-                # In a real implementation, we would call the CDP Wallet API
-                # This is mocked for demo purposes
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "CB-ACCESS-KEY": self.api_key,
-                    "CB-ACCESS-SIGN": "simulated_signature",  # Would be generated in real implementation
-                    "Content-Type": "application/json"
-                }
-                
-                # This would be a real API call in production
-                # response = requests.get(
-                #     f"{self.cdp_wallet_api_url}/accounts/{wallet_address}",
-                #     headers=headers
-                # )
-                
-                # if response.status_code == 200:
-                #     return response.json()
-                # else:
-                #     raise Exception(f"CDP API error: {response.status_code} - {response.text}")
-                
-                # For demo purposes, return simulated data
-                return {
-                    "address": wallet_address,
-                    "network": self.network["name"],
-                    "balance": {
-                        self.default_currency: "100.00",
-                        "ETH": "0.5"
-                    },
-                    "supports_x402": True
-                }
+                # Use the real CDP SDK
+                try:
+                    # Create a wallet instance or get existing one
+                    wallet = Wallet.fetch(wallet_address)
+                    
+                    # Get balance information
+                    balance_info = wallet.balance(self.default_currency)
+                    
+                    return {
+                        "address": wallet_address,
+                        "network": self.network["name"],
+                        "balance": {
+                            self.default_currency: str(balance_info.amount),
+                            "ETH": "0.5"  # Placeholder for demo
+                        },
+                        "supports_x402": True,
+                        "wallet_id": wallet.id if hasattr(wallet, 'id') else None
+                    }
+                    
+                except Exception as e:
+                    logger.warning(f"CDP wallet fetch failed: {e}, falling back to simulation")
+                    if not self.enable_fallback:
+                        raise
             
-            raise Exception("CDP API credentials not available")
+            raise Exception("CDP SDK or credentials not available")
                 
         except Exception as e:
             logger.error(f"Error getting wallet info: {e}")
             
             if not self.enable_fallback:
-                raise
+                raise RuntimeError(f"Wallet service unavailable: {e}")
         
         # Fallback or simulation mode
         logger.info("Using simulated wallet info (fallback mode)")
@@ -286,8 +293,48 @@ class PaymentManager:
                 self.default_currency: "100.00",
                 "ETH": "0.5"
             },
-            "supports_x402": True
+            "supports_x402": True,
+            "mode": "simulation"
         }
+    
+    def create_wallet(self) -> Dict[str, Any]:
+        """
+        Create a new CDP wallet
+        
+        Returns:
+            Dictionary with new wallet information
+        """
+        try:
+            if HAS_CDP and self.api_key and self.api_secret:
+                logger.info("Creating new CDP wallet")
+                
+                # Create a new wallet using CDP SDK
+                wallet = Wallet.create()
+                
+                return {
+                    "wallet_id": wallet.id,
+                    "address": wallet.default_address.address_id,
+                    "network": self.network["name"],
+                    "created": True
+                }
+            
+            raise Exception("CDP SDK not available")
+            
+        except Exception as e:
+            logger.error(f"Error creating wallet: {e}")
+            
+            if not self.enable_fallback:
+                raise RuntimeError(f"Wallet creation failed: {e}")
+            
+            # Fallback simulation
+            logger.info("Using simulated wallet creation")
+            return {
+                "wallet_id": f"wallet-{uuid.uuid4().hex[:8]}",
+                "address": f"0x{uuid.uuid4().hex[:40]}",
+                "network": self.network["name"],
+                "created": True,
+                "mode": "simulation"
+            }
 
 # Create a singleton instance for easy import
 payment_manager = PaymentManager()
