@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+boto3
+requests
+httpx
+aiohttp
+python-jose
+base58
+rich

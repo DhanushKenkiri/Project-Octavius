@@ -21,3 +21,27 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Backend Python files
+backend/__pycache__/
+backend/*.pyc
+backend/.pytest_cache/
+backend/venv/
+backend/env/
+
+# Environment files
+.env
+backend/.env
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Blockchain/Crypto sensitive files
+*.pem
+*.key
+private_keys/
+wallets/
